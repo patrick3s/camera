@@ -1,0 +1,81 @@
+import requests
+import time
+from requests.auth import HTTPDigestAuth
+
+IP = "192.168.100.2"
+PORT = 80
+USER = "admin"
+PASS = "admin"
+
+def test_cgi_dahua_style():
+    print("--- Testando estilo Dahua/Xiongmai CGI ---")
+    urls = [
+        f"http://{IP}:{PORT}/cgi-bin/ptz.cgi?action=start&channel=0&code=Up&arg1=0&arg2=1&arg3=0",
+        f"http://{IP}:{PORT}/cgi-bin/ptz.cgi?action=start&channel=1&code=Up&arg1=0&arg2=1&arg3=0",
+        f"http://{IP}:{PORT}/cgi-bin/ptzctrl.cgi?action=start&channel=0&code=Up&arg1=0&arg2=1&arg3=0"
+    ]
+    for url in urls:
+        print(f"Testando {url}...")
+        try:
+            r = requests.get(url, auth=HTTPDigestAuth(USER, PASS), timeout=2)
+            print(f"  Status: {r.status_code}")
+            if r.status_code == 200 and r.text.strip() == "OK":
+                print(f"  [!] Sucesso CGI (câmera deve estar subindo!)")
+                time.sleep(2) # deixa subir
+                # Stop
+                stop_url = url.replace("action=start", "action=stop")
+                requests.get(stop_url, auth=HTTPDigestAuth(USER, PASS), timeout=2)
+                print("  [!] Stop enviado.")
+                return True
+        except Exception as e:
+            print(f"  Erro: {e}")
+    return False
+
+def test_onvif_raw():
+    print("\n--- Testando estilo Raw SOAP (ONVIF 8899) sem Zeep (Evita erro de namespace) ---")
+    # Este XML evita tags extras que a câmera não suporta
+    soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+  <soap:Header>
+  </soap:Header>
+  <soap:Body>
+    <tptz:ContinuousMove>
+      <tptz:ProfileToken>000</tptz:ProfileToken>
+      <tptz:Velocity>
+        <tt:PanTilt x="0.0" y="0.5" space="http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace"/>
+      </tptz:Velocity>
+    </tptz:ContinuousMove>
+  </soap:Body>
+</soap:Envelope>"""
+    
+    headers = {"Content-Type": "application/soap+xml; charset=utf-8"}
+    try:
+        url = f"http://{IP}:8899/onvif/ptz_service"
+        print(f"Enviando POST SOAP para {url}...")
+        r = requests.post(url, data=soap_body, headers=headers, auth=HTTPDigestAuth(USER, PASS), timeout=3)
+        print(f"  Status: {r.status_code}")
+        if r.status_code == 200:
+            print(f"  [!] SOAP ACEITO! Câmera deve estar movendo para cima.")
+            time.sleep(2)
+            # Stop
+            stop_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+  <soap:Body>
+    <tptz:Stop>
+      <tptz:ProfileToken>000</tptz:ProfileToken>
+      <tptz:PanTilt>true</tptz:PanTilt>
+      <tptz:Zoom>true</tptz:Zoom>
+    </tptz:Stop>
+  </soap:Body>
+</soap:Envelope>"""
+            requests.post(url, data=stop_body, headers=headers, auth=HTTPDigestAuth(USER, PASS), timeout=2)
+            print("  [!] Stop enviado.")
+            return True
+        else:
+            print("  Resposta:", r.text[:200])
+    except Exception as e:
+        print(f"  Erro: {e}")
+
+if __name__ == "__main__":
+    if not test_cgi_dahua_style():
+        test_onvif_raw()
