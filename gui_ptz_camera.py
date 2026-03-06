@@ -5,6 +5,7 @@ import threading
 import subprocess
 import os
 import signal
+import socket
 from requests.auth import HTTPDigestAuth
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QGridLayout)
@@ -186,80 +187,122 @@ class CameraControlApp(QMainWindow):
     def update_image(self, cv_img):
         self.video_label.setPixmap(QPixmap.fromImage(cv_img))
 
-    def send_onvif_auxiliary(self, command):
-        """Envia comandos auxiliares ONVIF (ex: tt:LightOn para ligar LED)"""
-        print(f"[*] Enviando comando auxiliar de luz ONVIF: {command}")
-        soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
-  <soap:Body>
-    <tptz:SendAuxiliaryCommand>
-      <tptz:ProfileToken>000</tptz:ProfileToken>
-      <tptz:AuxiliaryData>{command}</tptz:AuxiliaryData>
-    </tptz:SendAuxiliaryCommand>
-  </soap:Body>
-</soap:Envelope>"""
-        threading.Thread(target=self._fire_soap, args=(soap_body,)).start()
+    # --- Controle via RTSP (SET_PARAMETER / USER_CMD_SET) ---
+    # A câmera Jortan JT-8695 não possui ONVIF (porta 8899 fechada).
+    # Usa-se comandos RTSP com autenticação Digest (realm: HIipCamera).
 
+    def _get_rtsp_digest_auth(self, method, uri):
+        """Calcula o header Digest Auth para requisições RTSP."""
+        import hashlib, re
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect((CAM_IP, 554))
+        # OPTIONS
+        s.sendall(f'OPTIONS rtsp://{CAM_IP}:554/ RTSP/1.0\r\nCSeq: 1\r\n\r\n'.encode())
+        s.recv(4096)
+        # DESCRIBE sem auth para pegar nonce
+        s.sendall(f'DESCRIBE {uri} RTSP/1.0\r\nCSeq: 2\r\nAccept: application/sdp\r\n\r\n'.encode())
+        resp = s.recv(4096).decode(errors='ignore')
+        realm_m = re.search(r'realm="(.+?)"', resp)
+        nonce_m = re.search(r'nonce="(.+?)"', resp)
+        if not realm_m or not nonce_m:
+            s.close()
+            return None, None
+        realm = realm_m.group(1)
+        nonce = nonce_m.group(1)
+        ha1 = hashlib.md5(f'{USER}:{realm}:{PASS}'.encode()).hexdigest()
+        ha2 = hashlib.md5(f'{method}:{uri}'.encode()).hexdigest()
+        response = hashlib.md5(f'{ha1}:{nonce}:{ha2}'.encode()).hexdigest()
+        auth_hdr = f'Digest username="{USER}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{response}"'
+        return s, auth_hdr
 
-    def _fire_soap(self, soap_body):
-        """Dispara a instrução SOAP em back via Thread"""
-        headers = {"Content-Type": "application/soap+xml; charset=utf-8"}
+    def _send_rtsp_command(self, method, body, content_type="application/json"):
+        """Envia um comando RTSP (SET_PARAMETER ou USER_CMD_SET) com Digest Auth."""
+        uri = f'rtsp://{CAM_IP}:554/onvif1'
         try:
-            requests.post(ONVIF_URL, data=soap_body, headers=headers, auth=HTTPDigestAuth(USER, PASS), timeout=2)
+            s, auth = self._get_rtsp_digest_auth(method, uri)
+            if not s or not auth:
+                print(f"  [!] Falha ao obter auth Digest RTSP")
+                return
+            req = (f'{method} {uri} RTSP/1.0\r\n'
+                   f'CSeq: 3\r\n'
+                   f'Authorization: {auth}\r\n'
+                   f'Content-Type: {content_type}\r\n'
+                   f'Content-Length: {len(body)}\r\n\r\n{body}')
+            s.sendall(req.encode())
+            resp = s.recv(4096).decode(errors='ignore')
+            status_line = resp.split('\r\n')[0] if resp else 'Sem resposta'
+            print(f"  [RTSP] {method} -> {status_line}")
+            s.close()
         except Exception as e:
-            print(f"[!] Erro ao enviar SOAP: {e}")
+            print(f"  [!] Erro RTSP {method}: {e}")
 
     def send_ptz_soap(self, pan_speed, tilt_speed):
-        """Monta e injeta XML limpo (sem Speed namespace) direto na porta de serviço ONVIF"""
-        print(f"[*] Movendo -> Pan: {pan_speed}, Tilt: {tilt_speed}")
-        soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
-  <soap:Body>
-    <tptz:ContinuousMove>
-      <tptz:ProfileToken>000</tptz:ProfileToken>
-      <tptz:Velocity>
-        <tt:PanTilt x="{pan_speed}" y="{tilt_speed}" space="http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace"/>
-      </tptz:Velocity>
-    </tptz:ContinuousMove>
-  </soap:Body>
-</soap:Envelope>"""
-        threading.Thread(target=self._fire_soap, args=(soap_body,)).start()
+        """Envia comando PTZ via RTSP USER_CMD_SET (protocolo Jortan JT-8695)"""
+        # Mapear velocidades para direções do protocolo XM
+        if pan_speed > 0:
+            direction = "DirectionLeft"
+        elif pan_speed < 0:
+            direction = "DirectionRight"
+        elif tilt_speed < 0:
+            direction = "DirectionUp"
+        elif tilt_speed > 0:
+            direction = "DirectionDown"
+        else:
+            direction = "DirectionUp"
+        
+        step = int(abs(pan_speed or tilt_speed) * 10)
+        print(f"[*] PTZ -> {direction} (step={step})")
+        
+        body = json.dumps({
+            "Name": "OPPTZControl",
+            "OPPTZControl": {
+                "Command": direction,
+                "Parameter": {
+                    "Channel": 0,
+                    "MenuOpts": 0,
+                    "Pattern": "SetBegin",
+                    "Preset": -1,
+                    "Step": step,
+                    "Tour": 0
+                }
+            }
+        })
+        threading.Thread(target=self._send_rtsp_command, args=("USER_CMD_SET", body)).start()
 
     def stop_ptz(self):
-        """Envia pacote SOAP explícito exigindo parar motores"""
+        """Para o motor PTZ via RTSP USER_CMD_SET"""
         print("[*] Parando motor PTZ")
-        soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
-  <soap:Body>
-    <tptz:Stop>
-      <tptz:ProfileToken>000</tptz:ProfileToken>
-      <tptz:PanTilt>true</tptz:PanTilt>
-      <tptz:Zoom>true</tptz:Zoom>
-    </tptz:Stop>
-  </soap:Body>
-</soap:Envelope>"""
-        threading.Thread(target=self._fire_soap, args=(soap_body,)).start()
+        body = json.dumps({
+            "Name": "OPPTZControl",
+            "OPPTZControl": {
+                "Command": "DirectionUp",
+                "Parameter": {
+                    "Channel": 0,
+                    "MenuOpts": 0,
+                    "Pattern": "Stop",
+                    "Preset": -1,
+                    "Step": 0,
+                    "Tour": 0
+                }
+            }
+        })
+        threading.Thread(target=self._send_rtsp_command, args=("USER_CMD_SET", body)).start()
 
     # --- Funções Extras (Luz/Flash) ---
-    def _fire_cgi(self, payload):
-        """Envia comando CGI (devconfig) em background via Thread"""
-        headers = {"Content-Type": "application/json"}
-        try:
-            r = requests.post(CGI_URL, data=json.dumps(payload), headers=headers,
-                              auth=HTTPDigestAuth(USER, PASS), timeout=3)
-            print(f"  [CGI] Status: {r.status_code} | Resposta: {r.text[:200].strip()}")
-        except Exception as e:
-            print(f"  [!] Erro ao enviar CGI: {e}")
-
     def toggle_flash(self, checked):
         if checked:
             self.btn_flash.setText("💡 Luz Ligada")
             self.btn_flash.setStyleSheet("background-color: #F1C40F; color: #2C3E50; font-weight: bold; border-radius: 5px;")
-            self.send_onvif_auxiliary("tt:LightOn")
+            print("[*] Ligando WhiteLight via RTSP")
+            body = json.dumps({"Name": "Camera.WhiteLight", "Camera.WhiteLight": {"Enable": True}})
+            threading.Thread(target=self._send_rtsp_command, args=("USER_CMD_SET", body)).start()
         else:
             self.btn_flash.setText("💡 Luz (Flash)")
             self.btn_flash.setStyleSheet("background-color: #F39C12; color: white; font-weight: bold; border-radius: 5px;")
-            self.send_onvif_auxiliary("tt:LightOff")
+            print("[*] Desligando WhiteLight via RTSP")
+            body = json.dumps({"Name": "Camera.WhiteLight", "Camera.WhiteLight": {"Enable": False}})
+            threading.Thread(target=self._send_rtsp_command, args=("USER_CMD_SET", body)).start()
 
 
     # --- Funções de Áudio ---

@@ -11,13 +11,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configurações de conexão baseadas no .env
+USE_WEBCAM = os.getenv("USE_WEBCAM", "False").lower() in ("true", "1", "t", "yes")
 CAM_USER = os.getenv("CAMERA_USER", "admin")
-CAM_PASS = os.getenv("CAMERA_PASS", "admin")
-CAM_IP = os.getenv("CAMERA_IP", "192.168.100.2")
+CAM_PASS = os.getenv("CAMERA_PASS", "mito010894")
+CAM_IP = os.getenv("CAMERA_IP", "192.168.100.13")
 
-# URL RTSP primária ou secundária (Pode dar lag usando a primária 11 na IA de detecção dependendo do Wi-Fi)
-# Para forçar baixa resolução e deixar a IA rápida, usar /ucast/12
-RTSP_URL = f"rtsp://{CAM_USER}:{CAM_PASS}@{CAM_IP}:554/ucast/11"
+# Fonte de vídeo (Webcam ou Câmera IP RTSP)
+if USE_WEBCAM:
+    VIDEO_SOURCE = 0
+else:
+    VIDEO_SOURCE = f"rtsp://{CAM_USER}:{CAM_PASS}@{CAM_IP}:554/onvif1"
 
 # Configuração da pasta de rostos conhecidos
 KNOWN_FACES_DIR = "model_faces"
@@ -89,14 +92,20 @@ def load_known_faces():
     return known_face_encodings, known_face_names
 
 
-def run_recognition(rtsp_url, known_face_encodings, known_face_names):
+def run_recognition(video_source, known_face_encodings, known_face_names):
     """
     Loop principal do feed de vídeo, rodando o comparador de rostos.
     """
-    print(f"\n[*] Conectando à Câmera: {rtsp_url}")
+    print(f"\n[*] Conectando à Câmera: {'Webcam (Local)' if video_source == 0 else video_source}")
     
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-    cap = cv2.VideoCapture(rtsp_url)
+    if isinstance(video_source, str) and video_source.startswith("rtsp"):
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
+        cap = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG)
+    else:
+        cap = cv2.VideoCapture(video_source)
+        # Tenta forçar uma resolução menor na Webcam para ganhar FPS
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
     if not cap.isOpened():
         print("[!] Erro fatal: Câmera não respondeu ou credenciais incorretas.")
@@ -108,6 +117,9 @@ def run_recognition(rtsp_url, known_face_encodings, known_face_names):
     print("[+] Sistema Operacional! Exibindo Feed. (Use 'q' para sair)")
     
     prev_time = 0
+    frame_count = 0
+    # Altere de 3 a 10 dependendo do seu computador. Quanto maior, mais FPS (mas demora um pouco mais a caixa atualizar a posição do rosto ao mover)
+    PROCESS_EVERY_N_FRAMES = 5 
     process_this_frame = True
 
     # Cache de resultados por frame pulado
@@ -124,12 +136,14 @@ def run_recognition(rtsp_url, known_face_encodings, known_face_names):
         # Salva o frame original, ANTES de desenharmos os quadrados por cima
         clean_frame = frame.copy()
 
-        # Reduzir tamanho (1/4) para o algoritmo rodar rápido em CPU
-        small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-        rgb_small_frame = np.ascontiguousarray(small_frame[:, :, ::-1])
+        # Reduzir tamanho (1/5) para o algoritmo rodar muito rápido em CPU
+        small_frame = cv2.resize(frame, (0, 0), fx=0.2, fy=0.2)
+        
+        # Converte de BGR (OpenCV) pra RGB (face_recognition). cv2.cvtColor costuma ser mais rápido que slice do numpy
+        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-        # Apenas processa as engrenagens pesadas frame sim, frame não
-        if process_this_frame:
+        # Apenas processa as engrenagens pesadas a cada N frames
+        if frame_count % PROCESS_EVERY_N_FRAMES == 0:
             # 1. Acha ONDE tem rosto na imagem minificada (usamos modelo HOG)
             face_locations = face_recognition.face_locations(rgb_small_frame, model="hog")
             
@@ -153,17 +167,17 @@ def run_recognition(rtsp_url, known_face_encodings, known_face_names):
                 
                 face_names.append(name)
 
-        process_this_frame = not process_this_frame
+        frame_count += 1
 
         # ========================================================
         # INTERFACE VISUAL (Desenho das Tags)
         # ========================================================
-        # Os locations estavam em uma escala 1/4 (multiplica de novo)
+        # Os locations estavam em uma escala 1/5 (multiplica por 5 de novo)
         for (top, right, bottom, left), name in zip(face_locations, face_names):
-            top *= 4
-            right *= 4
-            bottom *= 4
-            left *= 4
+            top *= 5
+            right *= 5
+            bottom *= 5
+            left *= 5
 
             # Define a cor baseado em "Sei quem é" vs "Intruso"
             color = (0, 255, 0) if name != "Desconhecido" else (0, 0, 255)
@@ -211,11 +225,5 @@ if __name__ == "__main__":
     # Carrega database em disco antes da câmera ligar
     encodings, names = load_known_faces()
     
-    # Tenta usar a sua rede local
-    CAMERA_IP = "192.168.100.2"
-    USER = "admin"
-    PASS = "admin"
-    RTSP_URL = f"rtsp://{USER}:{PASS}@{CAMERA_IP}:554/live/ch0"
-    
     # Inicia motor e feed
-    run_recognition(RTSP_URL, encodings, names)
+    run_recognition(VIDEO_SOURCE, encodings, names)
