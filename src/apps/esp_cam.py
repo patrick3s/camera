@@ -3,14 +3,14 @@ import time
 import sys
 import os
 
-def display_camera(rtsp_url):
+def display_camera(stream_url):
     """Tenta abrir e exibir o stream de vídeo da câmera."""
-    print(f"[*] Tentando conectar ao stream: {rtsp_url}")
+    print(f"[*] Tentando conectar ao stream: {stream_url}")
     
     # Define variáveis de ambiente para o OpenCV não travar em caso de erro de conexão
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
     
-    cap = cv2.VideoCapture(rtsp_url)
+    cap = cv2.VideoCapture(stream_url)
     
     if not cap.isOpened():
         print("[!] Erro: Não foi possível abrir o stream RTSP.")
@@ -45,18 +45,17 @@ def display_camera(rtsp_url):
     print("[*] Visualizador encerrado.")
 
 if __name__ == "__main__":
-    # Configuração da câmera encontrada (Ajuste usuário e senha se necessário)
-    CAMERA_IP = "192.168.100.2"
-    USER = "admin"
-    PASS = "admin"  # <--- Tente 'admin', '12345' ou a senha configurada na câmera
+    # Configuração para ESP-CAM
+    CAMERA_IP = "192.168.168.102"
     
-    # Caminhos RTSP comuns (varia por fabricante)
-    # 1. Hikvision/Dahua: /live/ch0 ou /cam/realmonitor?channel=1&subtype=0
-    # 2. ONVIF Genérico: /onvif1 ou /onvif-profile-1
-    RTSP_URL = f"rtsp://{USER}:{PASS}@{CAMERA_IP}:554/live/ch0"
+    # Caminhos comuns para streaming de ESP32-CAM:
+    # O stream MJPEG na maioria dos projetos 'CameraWebServer' fica na porta 81 com o caminho /stream.
+    # Ex: http://192.168.168.102:81/stream
+    # Caso sua ESP-CAM esteja configurada para a raiz na porta 80, altere para "http://{CAMERA_IP}/"
+    STREAM_URL = f"http://{CAMERA_IP}:81/stream"
     
-    # Se o usuário passar um IP por argumento, usamos ele
+    # Se o usuário passar uma URL por argumento, usamos ela
     if len(sys.argv) > 1:
-        RTSP_URL = sys.argv[1]
+        STREAM_URL = sys.argv[1]
         
-    display_camera(RTSP_URL)
+    display_camera(STREAM_URL)
